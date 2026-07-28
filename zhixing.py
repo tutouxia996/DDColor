@@ -4,11 +4,12 @@ import numpy as np
 import torch
 import functools
 import fastai.basic_train
+from PIL import Image
 
 # ========== 强制所有临时文件存到D盘 ==========
 import tempfile
 # 1. 新建D盘临时文件夹
-temp_dir = "D:\AI_Temp"
+temp_dir = r"D:\AI_Temp"
 os.makedirs(temp_dir, exist_ok=True)
 # 2. 让Python临时文件存到D盘
 tempfile.tempdir = temp_dir
@@ -86,6 +87,27 @@ colorizer._device = DEVICE  # 仅指定设备属性，无需手动迁移模型�
 colorizer.render_factor = 35
 
 
+# ===================== Unicode 中文路径支持 =====================
+def imread_unicode(filepath):
+    """cv2.imread 替代，支持中文路径（Windows兼容）"""
+    with open(filepath, 'rb') as f:
+        data = f.read()
+    img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"无法读取图片: {filepath}")
+    return img
+
+
+def imwrite_unicode(filepath, img):
+    """cv2.imwrite 替代，支持中文路径（Windows兼容）"""
+    ext = os.path.splitext(filepath)[1].lower() or '.jpg'
+    success, buf = cv2.imencode(ext, img)
+    if not success:
+        raise IOError(f"编码失败: {filepath}")
+    with open(filepath, 'wb') as f:
+        f.write(buf.tobytes())
+
+
 # ===================== 批量处理核心函数 =====================
 def process_single_image(img_path, colorizer):
     img_name = os.path.basename(img_path)
@@ -95,9 +117,14 @@ def process_single_image(img_path, colorizer):
     OUTPUT_IMAGE = os.path.join(output_dir, f"deoldify_{img_name}")
 
     try:
-        # 上色（DeOldify会自动使用指定的_device）
+        # 用 Unicode 安全的读取方式加载图片，再转成 PIL Image 传给 DeOldify
+        img_bgr = imread_unicode(img_path)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+
+        # 上色（传 PIL Image 给 image= 参数，绕过 DeOldify 内部的中文路径问题）
         img_color = colorizer.get_transformed_image(
-            path=img_path,
+            image=pil_img,
             render_factor=35
         )
 
@@ -106,9 +133,9 @@ def process_single_image(img_path, colorizer):
         if img_array.shape[0] > 20:
             img_array = img_array[:-20, :, :]
 
-        # 转换通道并保存
-        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(OUTPUT_IMAGE, img_bgr)
+        # 转换通道并用 Unicode 安全方式保存
+        img_bgr_out = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        imwrite_unicode(OUTPUT_IMAGE, img_bgr_out)
 
         print(f"✅ 处理完成：{img_path}")
         print(f"   结果保存：{os.path.abspath(OUTPUT_IMAGE)}")

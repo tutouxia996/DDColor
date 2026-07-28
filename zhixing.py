@@ -79,14 +79,6 @@ if not os.path.exists(MODEL_PATH):
     print("💡 请先运行 download_deoldify_model.py 下载模型")
     exit(1)
 
-# ===================== 初始化模型（核心修复：正确指定GPU） =====================
-print("ℹ️ 正在加载DeOldify模型...")
-# 修复：DeOldify的colorizer通过learn属性访问模型，且无需手动迁移（已通过map_location加载到GPU）
-colorizer = get_image_colorizer(artistic=False)
-colorizer._device = DEVICE  # 仅指定设备属性，无需手动迁移模型（已通过torch.load的map_location加载到GPU）
-colorizer.render_factor = 35
-
-
 # ===================== Unicode 中文路径支持 =====================
 def imread_unicode(filepath):
     """cv2.imread 替代，支持中文路径（Windows兼容）"""
@@ -108,6 +100,28 @@ def imwrite_unicode(filepath, img):
         f.write(buf.tobytes())
 
 
+# ===================== 初始化模型（核心修复：正确指定GPU） =====================
+print("ℹ️ 正在加载DeOldify模型...")
+# 修复：DeOldify的colorizer通过learn属性访问模型，且无需手动迁移（已通过map_location加载到GPU）
+colorizer = get_image_colorizer(artistic=False)
+colorizer._device = DEVICE  # 仅指定设备属性，无需手动迁移模型（已通过torch.load的map_location加载到GPU）
+colorizer.render_factor = 35
+
+# ===================== 猴子补丁：修复 DeOldify 中文路径支持 =====================
+# DeOldify 内部用 PIL.Image.open() 读取图片，Windows 上对中文路径会失败。
+# 替换 _open_pil_image 为 Unicode 安全版本，让 path= 参数可以直接传中文路径。
+import types as _types
+
+
+def _open_pil_image_unicode(self, path):
+    img_bgr = imread_unicode(str(path))
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(img_rgb)
+
+
+colorizer._open_pil_image = _types.MethodType(_open_pil_image_unicode, colorizer)
+
+
 # ===================== 批量处理核心函数 =====================
 def process_single_image(img_path, colorizer):
     img_name = os.path.basename(img_path)
@@ -117,14 +131,9 @@ def process_single_image(img_path, colorizer):
     OUTPUT_IMAGE = os.path.join(output_dir, f"deoldify_{img_name}")
 
     try:
-        # 用 Unicode 安全的读取方式加载图片，再转成 PIL Image 传给 DeOldify
-        img_bgr = imread_unicode(img_path)
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(img_rgb)
-
-        # 上色（传 PIL Image 给 image= 参数，绕过 DeOldify 内部的中文路径问题）
+        # 上色：path= 现在支持中文（猴子补丁已替换 _open_pil_image）
         img_color = colorizer.get_transformed_image(
-            image=pil_img,
+            path=img_path,
             render_factor=35
         )
 

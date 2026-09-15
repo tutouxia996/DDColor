@@ -165,17 +165,19 @@ def mean_chroma(img_bgr: np.ndarray) -> float:
 
 
 def crop_photo_region(img_bgr: np.ndarray, enabled: bool = True):
-    """裁掉相纸册白色页边，只上色照片芯。返回 (crop, (y0,y1,x0,x1))。"""
+    """仅在确有白页边时裁切；无页边则原样返回，避免贴回灰边框。"""
+    h, w = img_bgr.shape[:2]
     if not enabled:
-        h, w = img_bgr.shape[:2]
         return img_bgr, (0, h, 0, w)
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-    # 近白页边
-    mask = gray < 245
-    # 去掉底部标题条附近的纯黑块干扰：取最大连通内容
-    mask = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    white = gray >= 245
+    white_ratio = float(white.mean())
+    if white_ratio < 0.02:
+        return img_bgr, (0, h, 0, w)
+
+    mask = (~white).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
     ys, xs = np.where(mask > 0)
     if len(xs) < 1000:
@@ -183,27 +185,23 @@ def crop_photo_region(img_bgr: np.ndarray, enabled: bool = True):
 
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
-    # 稍内缩，避开扫描毛边
-    pad_y = max(2, (y1 - y0) // 80)
-    pad_x = max(2, (x1 - x0) // 80)
-    y0, y1 = max(0, y0 + pad_y), min(h, y1 - pad_y)
-    x0, x1 = max(0, x0 + pad_x), min(w, x1 - pad_x)
+    pad_y = max(2, (y1 - y0) // 200)
+    pad_x = max(2, (x1 - x0) // 200)
+    y0, y1 = max(0, y0 - pad_y), min(h, y1 + pad_y)
+    x0, x1 = max(0, x0 - pad_x), min(w, x1 + pad_x)
 
-    # 裁太狠就放弃
+    if (y1 - y0) > h * 0.97 and (x1 - x0) > w * 0.97:
+        return img_bgr, (0, h, 0, w)
     if (y1 - y0) < h * 0.45 or (x1 - x0) < w * 0.45:
         return img_bgr, (0, h, 0, w)
     return img_bgr[y0:y1, x0:x1], (y0, y1, x0, x1)
 
 
 def paste_photo_region(full_bgr: np.ndarray, crop_bgr: np.ndarray, box) -> np.ndarray:
+    """贴回时：页边用浅色纸底，不再用整图灰度，避免出现黑白相框。"""
     y0, y1, x0, x1 = box
-    out = full_bgr.copy()
-    # 页边保持中性灰，避免整页发黄
-    gray = cv2.cvtColor(full_bgr, cv2.COLOR_BGR2GRAY)
-    page = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    out[:] = page
+    out = np.full_like(full_bgr, 245)
     ch, cw = crop_bgr.shape[:2]
-    # 尺寸可能因处理略变，强制对齐
     if (ch, cw) != (y1 - y0, x1 - x0):
         crop_bgr = cv2.resize(crop_bgr, (x1 - x0, y1 - y0), interpolation=cv2.INTER_CUBIC)
     out[y0:y1, x0:x1] = crop_bgr
@@ -235,6 +233,40 @@ def prepare_input(img_bgr: np.ndarray, deyellow: bool, autocontrast: bool) -> np
     return out
 
 
+def _sky_soft_mask(L: np.ndarray) -> np.ndarray:
+    """偏亮、偏上、纹理少 → 天空候选（用于限 chroma / 压色块）。"""
+    h, w = L.shape
+    top = np.linspace(1.0, 0.18, h, dtype=np.float32)[:, None]
+    top = np.broadcast_to(top, (h, w)).copy()
+    bright = np.clip((L - 145.0) / 70.0, 0.0, 1.0)
+    Lf = cv2.GaussianBlur(L.astype(np.float32), (0, 0), 2.5)
+    var = cv2.blur((L.astype(np.float32) - Lf) ** 2, (21, 21))
+    smooth = 1.0 - np.clip(var / 90.0, 0.0, 1.0)
+    m = bright * top * (0.35 + 0.65 * smooth)
+    return cv2.GaussianBlur(m, (0, 0), max(2.0, min(h, w) / 180.0))
+
+
+def _fix_sky_yellow_green(L: np.ndarray, a: np.ndarray, b: np.ndarray):
+    """压制天空黄/黄绿大色块，尽量不动水面与船体。"""
+    h, w = L.shape
+    sky_base = _sky_soft_mask(L)
+    yellow = np.clip((b - 128.0) / 16.0, 0.0, 1.0)
+    greenish = np.clip((128.0 - a) / 14.0, 0.0, 1.0) * np.clip((b - 120.0) / 14.0, 0.0, 1.0)
+    cast = np.clip(yellow * 0.9 + greenish * 1.2, 0.0, 1.0)
+    blotch = (sky_base * cast > 0.22).astype(np.uint8) * 255
+    k = max(5, (min(h, w) // 80) | 1)
+    blotch = cv2.morphologyEx(blotch, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    blotch = cv2.dilate(blotch, np.ones((k, k), np.uint8), iterations=1)
+    blotch = cv2.GaussianBlur(blotch.astype(np.float32) / 255.0, (0, 0), max(3.0, k / 2.0))
+    sky = np.clip(sky_base * cast * 0.55 + blotch * sky_base * 0.85, 0.0, 1.0)
+    a = a * (1.0 - sky * 0.95) + 128.0 * (sky * 0.95)
+    b = b * (1.0 - sky * 0.96) + 118.0 * (sky * 0.96)
+    hi = np.clip((L - 155.0) / 75.0, 0.0, 1.0) * sky_base
+    b = b - hi * np.clip(b - 128.0, 0.0, None) * 0.85
+    a = a + hi * np.clip(120.0 - a, 0.0, None) * 0.45
+    return a, b
+
+
 def adjust_color(img_bgr: np.ndarray, chroma: float = 1.35, cool: float = 0.25) -> np.ndarray:
     """增强颜色、压黄、去红蓝边缘重影。"""
     chroma = float(np.clip(chroma, 0.5, 2.2))
@@ -243,7 +275,6 @@ def adjust_color(img_bgr: np.ndarray, chroma: float = 1.35, cool: float = 0.25) 
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     L, a, b = cv2.split(lab)
 
-    # 若模型输出本身很淡，自动再加一点浓度
     cur = float(np.sqrt((a - 128) ** 2 + (b - 128) ** 2).mean())
     auto_boost = 1.0
     if cur < 5:
@@ -252,21 +283,16 @@ def adjust_color(img_bgr: np.ndarray, chroma: float = 1.35, cool: float = 0.25) 
         auto_boost = 1.25
     chroma_eff = chroma * auto_boost
 
-    a = 128.0 + (a - 128.0) * chroma_eff
-    b = 128.0 + (b - 128.0) * chroma_eff
+    sky_m = _sky_soft_mask(L)
+    gain = 1.0 + (chroma_eff - 1.0) * (1.0 - sky_m * 0.9)
+    a = 128.0 + (a - 128.0) * gain
+    b = 128.0 + (b - 128.0) * gain
 
-    # 去黄：老照片高光/纸基很容易整页发黄
     mean_b = float(b.mean())
     if mean_b > 130:
         b -= (mean_b - 128.0) * 0.7
-    highlight = np.clip((L - 170.0) / 85.0, 0, 1)
-    b = b - highlight * np.clip(b - 128.0, 0, None) * 0.65
-    # 天空/过曝区直接拉回中性，避免奶油黄
-    sky = np.clip((L - 200.0) / 40.0, 0, 1)
-    a = a * (1.0 - sky * 0.7) + 128.0 * (sky * 0.7)
-    b = b * (1.0 - sky * 0.7) + 128.0 * (sky * 0.7)
+    a, b = _fix_sky_yellow_green(L, a, b)
 
-    # 轻压红斑
     if cool > 0:
         mean_a = float(a.mean())
         if mean_a > 132:
@@ -274,31 +300,14 @@ def adjust_color(img_bgr: np.ndarray, chroma: float = 1.35, cool: float = 0.25) 
         red_excess = np.clip(a - 145.0, 0.0, None)
         a -= red_excess * (0.5 * cool)
 
-    # 红蓝重影：亮度边缘处平滑 a/b
     L8 = np.clip(L, 0, 255).astype(np.uint8)
     edges = cv2.Canny(L8, 40, 120)
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
-    edges = cv2.GaussianBlur(edges.astype(np.float32) / 255.0, (9, 9), 0)
-    a_s = cv2.bilateralFilter(a.astype(np.float32), 9, 22, 9)
-    b_s = cv2.bilateralFilter(b.astype(np.float32), 9, 22, 9)
-    a = a * (1.0 - edges * 0.95) + a_s * (edges * 0.95)
-    b = b * (1.0 - edges * 0.95) + b_s * (edges * 0.95)
-
-    # 四周边缘去色一点，消扫描页边红蓝条
-    h, w = a.shape
-    border = np.ones((h, w), np.float32)
-    bw = max(8, w // 60)
-    bh = max(8, h // 60)
-    for i in range(bh):
-        fade = i / bh
-        border[i, :] *= fade
-        border[h - 1 - i, :] *= fade
-    for i in range(bw):
-        fade = i / bw
-        border[:, i] *= fade
-        border[:, w - 1 - i] *= fade
-    a = 128.0 + (a - 128.0) * border
-    b = 128.0 + (b - 128.0) * border
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    edges = cv2.GaussianBlur(edges.astype(np.float32) / 255.0, (5, 5), 0)
+    a_s = cv2.bilateralFilter(a.astype(np.float32), 7, 18, 7)
+    b_s = cv2.bilateralFilter(b.astype(np.float32), 7, 18, 7)
+    a = a * (1.0 - edges * 0.7) + a_s * (edges * 0.7)
+    b = b * (1.0 - edges * 0.7) + b_s * (edges * 0.7)
 
     out = cv2.cvtColor(
         cv2.merge(

@@ -4,7 +4,8 @@ numpy==1.24.3
 opencv-python==4.7.0.72
 pillow
 tqdm
-huggingface-hub
+huggingface-hub>=0.23,<0.26
+gradio>=4.44,<5
 
 # training dependencies
 pyyaml

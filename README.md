@@ -15,7 +15,7 @@
 
 ## 📋 目录
 
-- [快速开始（DeOldify，推荐）](#快速开始deoldify推荐)
+- [快速开始（双模型）](#快速开始双模型)
 - [模型缓存位置说明](#模型缓存位置说明)
 - [DDColor 使用方式](#ddcolor-使用方式)
 - [常见问题](#常见问题)
@@ -24,7 +24,41 @@
 
 ---
 
-## 快速开始（DeOldify，推荐）
+## 快速开始（双模型）
+
+两套模型都保留，可用同一入口切换：
+
+| 模型 | 权重（`models/`） | 说明 |
+|------|-------------------|------|
+| **DDColor modelscope** | `ddcolor_modelscope.bin` | 开源里较新、通常更自然（默认） |
+| **DDColor artistic** | `ddcolor_artistic.bin` | 红斑/脏色往往更少 |
+| **DeOldify Stable** | `ColorizeStable_gen.pth` | 经典稳妥，偏旧 |
+| **DeOldify Artistic** | `ColorizeArtistic_gen.pth` | 颜色更艳 |
+| **DeOldify Video** | `ColorizeVideo_gen.pth` | 视频上色用 |
+
+> 说明：DeOldify 开源权重停在 Artistic / Stable / Video，没有更新版；DDColor 已是 Hugging Face 当前发布的最新权重。
+
+### 下载 / 刷新权重
+
+```bash
+venv\Scripts\activate
+python download_models.py
+```
+
+### 运行上色
+
+```bash
+# 把黑白图放进 test_images/ 后：
+python zhixing.py --model ddcolor                 # 推荐先试这个
+python zhixing.py --model ddcolor-artistic
+python zhixing.py --model deoldify --render-factor 22
+python zhixing.py --model deoldify-artistic --render-factor 22
+python zhixing.py --model both                    # 两套各出一份结果到 results/
+```
+
+---
+
+## 快速开始（DeOldify，旧文档）
 
 ### 环境要求
 

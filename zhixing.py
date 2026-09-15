@@ -1,88 +1,69 @@
+"""Batch colorize old photos with DeOldify and/or DDColor.
+
+针对发黄相纸册页（如京张路工写真）的推荐命令：
+  python zhixing.py
+  # 默认即为上一档：chroma=1.35, input-size=768
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
+import sys
+import tempfile
+import types
+import warnings
+from pathlib import Path
+
 import cv2
 import numpy as np
 import torch
-import functools
-import fastai.basic_train
 from PIL import Image
 
-# ========== 强制所有临时文件存到D盘 ==========
-import tempfile
-# 1. 新建D盘临时文件夹
+# ========== Force temp / caches onto D: ==========
 temp_dir = r"D:\AI_Temp"
 os.makedirs(temp_dir, exist_ok=True)
-# 2. 让Python临时文件存到D盘
 tempfile.tempdir = temp_dir
-# 3. 让OpenCV临时文件存到D盘
-os.environ['OPENCV_TEMP_DIR'] = temp_dir
-# 4. 让PyTorch缓存存到D盘
-os.environ['TORCH_HOME'] = os.path.join(temp_dir, "torch_cache")
-os.environ['FASTAI_HOME'] = os.path.join(temp_dir, "fastai_cache")
+os.environ["OPENCV_TEMP_DIR"] = temp_dir
+os.environ["TORCH_HOME"] = os.path.join(temp_dir, "torch_cache")
+os.environ["FASTAI_HOME"] = os.path.join(temp_dir, "fastai_cache")
+os.environ.setdefault("HF_HOME", os.path.join(temp_dir, "hf_cache"))
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-# ===================== 兼容低版本PyTorch 2.1.0 =====================
-if not hasattr(torch.serialization, 'add_safe_globals'):
-    def add_safe_globals(globals_list):
-        pass
+ROOT = Path(__file__).resolve().parent
+MODELS = ROOT / "models"
+os.environ["DEOLDIFY_MODEL_DIR"] = str(MODELS)
+
+if not hasattr(torch.serialization, "add_safe_globals"):
+    torch.serialization.add_safe_globals = lambda globals_list: None  # type: ignore
 
 
-    torch.serialization.add_safe_globals = add_safe_globals
-
-
-# ===================== 检测并启用GPU（4060专属） =====================
 def check_cuda():
     if not torch.cuda.is_available():
-        print("❌ 未检测到可用GPU，自动切换到CPU运行")
+        print("未检测到可用 GPU，使用 CPU")
         return torch.device("cpu")
-    else:
-        device = torch.device("cuda:0")
-        print(f"✅ 成功启用GPU：{torch.cuda.get_device_name(0)}")
-        return device
+    device = torch.device("cuda:0")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    return device
 
 
 DEVICE = check_cuda()
-
-# ===================== 重写torch.load，适配GPU+低版本 =====================
-original_torch_load = torch.load
+_original_torch_load = torch.load
 
 
-def patched_torch_load(*args, **kwargs):
-    if 'weights_only' in kwargs:
-        del kwargs['weights_only']
+def _patched_torch_load(*args, **kwargs):
+    kwargs.pop("weights_only", None)
     if DEVICE.type == "cuda":
-        kwargs['map_location'] = DEVICE
-    return original_torch_load(*args, **kwargs)
+        kwargs.setdefault("map_location", DEVICE)
+    return _original_torch_load(*args, **kwargs)
 
 
-torch.load = patched_torch_load
-
-# ===================== 基础配置 =====================
-import warnings
-
+torch.load = _patched_torch_load
 warnings.filterwarnings("ignore")
-os.environ['DEOLDIFY_MODEL_DIR'] = os.path.join(os.getcwd(), 'models')
 
-try:
-    from deoldify.visualize import get_image_colorizer
-except ImportError as e:
-    print(f"❌ 依赖缺失：{e}")
-    print("💡 执行：pip install fastprogress fastai==2.7.10 deoldify -i https://pypi.tuna.tsinghua.edu.cn/simple")
-    exit(1)
 
-# 创建文件夹
-os.makedirs("results", exist_ok=True)
-os.makedirs("models", exist_ok=True)
-
-# ===================== 检查权重 =====================
-MODEL_PATH = os.path.join("models", "ColorizeStable_gen.pth")
-if not os.path.exists(MODEL_PATH):
-    print(f"❌ 未找到模型权重：{MODEL_PATH}")
-    print("💡 请先运行 download_deoldify_model.py 下载模型")
-    exit(1)
-
-# ===================== Unicode 中文路径支持 =====================
-def imread_unicode(filepath):
-    """cv2.imread 替代，支持中文路径（Windows兼容）"""
-    with open(filepath, 'rb') as f:
+def imread_unicode(filepath: str):
+    with open(filepath, "rb") as f:
         data = f.read()
     img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
@@ -90,94 +71,442 @@ def imread_unicode(filepath):
     return img
 
 
-def imwrite_unicode(filepath, img):
-    """cv2.imwrite 替代，支持中文路径（Windows兼容）"""
-    ext = os.path.splitext(filepath)[1].lower() or '.jpg'
-    success, buf = cv2.imencode(ext, img)
+def imwrite_unicode(filepath: str, img) -> None:
+    ext = os.path.splitext(filepath)[1].lower() or ".jpg"
+    success, buf = cv2.imencode(ext, img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     if not success:
         raise IOError(f"编码失败: {filepath}")
-    with open(filepath, 'wb') as f:
+    with open(filepath, "wb") as f:
         f.write(buf.tobytes())
 
 
-# ===================== 初始化模型（核心修复：正确指定GPU） =====================
-print("ℹ️ 正在加载DeOldify模型...")
-# 修复：DeOldify的colorizer通过learn属性访问模型，且无需手动迁移（已通过map_location加载到GPU）
-colorizer = get_image_colorizer(artistic=False)
-colorizer._device = DEVICE  # 仅指定设备属性，无需手动迁移模型（已通过torch.load的map_location加载到GPU）
-colorizer.render_factor = 35
-
-# ===================== 猴子补丁：修复 DeOldify 中文路径支持 =====================
-# DeOldify 内部用 PIL.Image.open() 读取图片，Windows 上对中文路径会失败。
-# 替换 _open_pil_image 为 Unicode 安全版本，让 path= 参数可以直接传中文路径。
-import types as _types
+def collect_images(input_dir: Path):
+    supported = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+    paths = []
+    for root, _, files in os.walk(input_dir):
+        for name in files:
+            if Path(name).suffix.lower() in supported:
+                paths.append(Path(root) / name)
+    return sorted(paths)
 
 
-def _open_pil_image_unicode(self, path):
-    img_bgr = imread_unicode(str(path))
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(img_rgb)
+def resolve_ddcolor_weight(kind: str) -> Path:
+    if kind == "modelscope":
+        candidates = [
+            MODELS / "ddcolor_modelscope.bin",
+            MODELS / "ddcolor_modelscope.pt",
+            ROOT / "modelscope" / "damo" / "cv_ddcolor_image-colorization" / "pytorch_model.pt",
+        ]
+    else:
+        candidates = [
+            MODELS / "ddcolor_artistic.bin",
+            MODELS / "ddcolor_artistic.pt",
+        ]
+    for p in candidates:
+        if p.exists() and p.stat().st_size > 100_000_000:
+            return p
+    raise FileNotFoundError(
+        f"找不到 DDColor ({kind}) 权重。请先运行: python download_models.py\n"
+        f"已尝试: {', '.join(str(c) for c in candidates)}"
+    )
 
 
-colorizer._open_pil_image = _types.MethodType(_open_pil_image_unicode, colorizer)
-
-
-# ===================== 批量处理核心函数 =====================
-def process_single_image(img_path, colorizer):
-    img_name = os.path.basename(img_path)
-    relative_path = os.path.relpath(img_path, "test_images")
-    output_dir = os.path.join("results", os.path.dirname(relative_path))
-    os.makedirs(output_dir, exist_ok=True)
-    OUTPUT_IMAGE = os.path.join(output_dir, f"deoldify_{img_name}")
-
+def load_deoldify(artistic: bool, render_factor: int):
     try:
-        # 上色：path= 现在支持中文（猴子补丁已替换 _open_pil_image）
-        img_color = colorizer.get_transformed_image(
-            path=img_path,
-            render_factor=35
+        from deoldify.visualize import get_image_colorizer
+    except ImportError as e:
+        print(f"DeOldify 依赖缺失: {e}")
+        sys.exit(1)
+
+    need = "ColorizeArtistic_gen.pth" if artistic else "ColorizeStable_gen.pth"
+    weight = MODELS / need
+    if not weight.exists():
+        print(f"缺少 DeOldify 权重: {weight}")
+        sys.exit(1)
+
+    print(f"加载 DeOldify ({'Artistic' if artistic else 'Stable'}) ...")
+    colorizer = get_image_colorizer(root_folder=ROOT, artistic=artistic, render_factor=render_factor)
+    colorizer._device = DEVICE
+    colorizer.render_factor = render_factor
+    return colorizer
+
+
+def load_ddcolor(kind: str, input_size: int):
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    # Ensure latest pipeline.py is picked up
+    for mod in list(sys.modules):
+        if mod == "ddcolor" or mod.startswith("ddcolor."):
+            del sys.modules[mod]
+    from ddcolor import DDColor, ColorizationPipeline, build_ddcolor_model
+
+    weight = resolve_ddcolor_weight(kind)
+    print(f"加载 DDColor ({kind}) @ {input_size} <- {weight.name}")
+    model = build_ddcolor_model(
+        DDColor,
+        model_path=str(weight),
+        input_size=input_size,
+        model_size="large",
+        device=DEVICE,
+    )
+    return ColorizationPipeline(model, input_size=input_size, device=DEVICE)
+
+
+def out_path_for(img_path: Path, input_root: Path, output_root: Path, prefix: str) -> Path:
+    rel = img_path.relative_to(input_root)
+    dest_dir = output_root / rel.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    return dest_dir / f"{prefix}_{img_path.name}"
+
+
+def mean_chroma(img_bgr: np.ndarray) -> float:
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    return float(np.sqrt((lab[:, :, 1] - 128) ** 2 + (lab[:, :, 2] - 128) ** 2).mean())
+
+
+def crop_photo_region(img_bgr: np.ndarray, enabled: bool = True):
+    """裁掉相纸册白色页边，只上色照片芯。返回 (crop, (y0,y1,x0,x1))。"""
+    if not enabled:
+        h, w = img_bgr.shape[:2]
+        return img_bgr, (0, h, 0, w)
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    # 近白页边
+    mask = gray < 245
+    # 去掉底部标题条附近的纯黑块干扰：取最大连通内容
+    mask = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 1000:
+        return img_bgr, (0, h, 0, w)
+
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    # 稍内缩，避开扫描毛边
+    pad_y = max(2, (y1 - y0) // 80)
+    pad_x = max(2, (x1 - x0) // 80)
+    y0, y1 = max(0, y0 + pad_y), min(h, y1 - pad_y)
+    x0, x1 = max(0, x0 + pad_x), min(w, x1 - pad_x)
+
+    # 裁太狠就放弃
+    if (y1 - y0) < h * 0.45 or (x1 - x0) < w * 0.45:
+        return img_bgr, (0, h, 0, w)
+    return img_bgr[y0:y1, x0:x1], (y0, y1, x0, x1)
+
+
+def paste_photo_region(full_bgr: np.ndarray, crop_bgr: np.ndarray, box) -> np.ndarray:
+    y0, y1, x0, x1 = box
+    out = full_bgr.copy()
+    # 页边保持中性灰，避免整页发黄
+    gray = cv2.cvtColor(full_bgr, cv2.COLOR_BGR2GRAY)
+    page = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    out[:] = page
+    ch, cw = crop_bgr.shape[:2]
+    # 尺寸可能因处理略变，强制对齐
+    if (ch, cw) != (y1 - y0, x1 - x0):
+        crop_bgr = cv2.resize(crop_bgr, (x1 - x0, y1 - y0), interpolation=cv2.INTER_CUBIC)
+    out[y0:y1, x0:x1] = crop_bgr
+    return out
+
+
+def neutralize_yellow(img_bgr: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    return cv2.cvtColor(lab[:, :, 0], cv2.COLOR_GRAY2BGR)
+
+
+def auto_contrast_luma(img_bgr: np.ndarray, clip_percent: float = 0.8) -> np.ndarray:
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L = lab[:, :, 0]
+    lo = np.percentile(L, clip_percent)
+    hi = np.percentile(L, 100.0 - clip_percent)
+    if hi <= lo + 1:
+        return img_bgr
+    lab[:, :, 0] = np.clip((L - lo) * (255.0 / (hi - lo)), 0, 255)
+    return cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def prepare_input(img_bgr: np.ndarray, deyellow: bool, autocontrast: bool) -> np.ndarray:
+    out = img_bgr
+    if deyellow:
+        out = neutralize_yellow(out)
+    if autocontrast:
+        out = auto_contrast_luma(out)
+    return out
+
+
+def adjust_color(img_bgr: np.ndarray, chroma: float = 1.35, cool: float = 0.25) -> np.ndarray:
+    """增强颜色、压黄、去红蓝边缘重影。"""
+    chroma = float(np.clip(chroma, 0.5, 2.2))
+    cool = float(np.clip(cool, 0.0, 1.0))
+
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L, a, b = cv2.split(lab)
+
+    # 若模型输出本身很淡，自动再加一点浓度
+    cur = float(np.sqrt((a - 128) ** 2 + (b - 128) ** 2).mean())
+    auto_boost = 1.0
+    if cur < 5:
+        auto_boost = 1.55
+    elif cur < 9:
+        auto_boost = 1.25
+    chroma_eff = chroma * auto_boost
+
+    a = 128.0 + (a - 128.0) * chroma_eff
+    b = 128.0 + (b - 128.0) * chroma_eff
+
+    # 去黄：老照片高光/纸基很容易整页发黄
+    mean_b = float(b.mean())
+    if mean_b > 130:
+        b -= (mean_b - 128.0) * 0.7
+    highlight = np.clip((L - 170.0) / 85.0, 0, 1)
+    b = b - highlight * np.clip(b - 128.0, 0, None) * 0.65
+    # 天空/过曝区直接拉回中性，避免奶油黄
+    sky = np.clip((L - 200.0) / 40.0, 0, 1)
+    a = a * (1.0 - sky * 0.7) + 128.0 * (sky * 0.7)
+    b = b * (1.0 - sky * 0.7) + 128.0 * (sky * 0.7)
+
+    # 轻压红斑
+    if cool > 0:
+        mean_a = float(a.mean())
+        if mean_a > 132:
+            a -= (mean_a - 128.0) * (0.45 * cool)
+        red_excess = np.clip(a - 145.0, 0.0, None)
+        a -= red_excess * (0.5 * cool)
+
+    # 红蓝重影：亮度边缘处平滑 a/b
+    L8 = np.clip(L, 0, 255).astype(np.uint8)
+    edges = cv2.Canny(L8, 40, 120)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=2)
+    edges = cv2.GaussianBlur(edges.astype(np.float32) / 255.0, (9, 9), 0)
+    a_s = cv2.bilateralFilter(a.astype(np.float32), 9, 22, 9)
+    b_s = cv2.bilateralFilter(b.astype(np.float32), 9, 22, 9)
+    a = a * (1.0 - edges * 0.95) + a_s * (edges * 0.95)
+    b = b * (1.0 - edges * 0.95) + b_s * (edges * 0.95)
+
+    # 四周边缘去色一点，消扫描页边红蓝条
+    h, w = a.shape
+    border = np.ones((h, w), np.float32)
+    bw = max(8, w // 60)
+    bh = max(8, h // 60)
+    for i in range(bh):
+        fade = i / bh
+        border[i, :] *= fade
+        border[h - 1 - i, :] *= fade
+    for i in range(bw):
+        fade = i / bw
+        border[:, i] *= fade
+        border[:, w - 1 - i] *= fade
+    a = 128.0 + (a - 128.0) * border
+    b = 128.0 + (b - 128.0) * border
+
+    out = cv2.cvtColor(
+        cv2.merge(
+            [
+                np.clip(L, 0, 255).astype(np.uint8),
+                np.clip(a, 0, 255).astype(np.uint8),
+                np.clip(b, 0, 255).astype(np.uint8),
+            ]
+        ),
+        cv2.COLOR_LAB2BGR,
+    )
+    return out
+
+
+def colorize_with_deoldify(colorizer, img_bgr: np.ndarray, render_factor: int) -> np.ndarray:
+    """DeOldify 接受路径；这里写临时文件。"""
+    tmp = Path(temp_dir) / "_deoldify_in.jpg"
+    imwrite_unicode(str(tmp), img_bgr)
+
+    def _open_prepared(self, path):
+        local = imread_unicode(str(path))
+        return Image.fromarray(cv2.cvtColor(local, cv2.COLOR_BGR2RGB))
+
+    colorizer._open_pil_image = types.MethodType(_open_prepared, colorizer)
+    img_color = colorizer.get_transformed_image(path=str(tmp), render_factor=render_factor)
+    arr = np.array(img_color)
+    if arr.shape[0] > 20:
+        arr = arr[:-20, :, :]
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+def process_one(
+    img_path: Path,
+    dest: Path,
+    *,
+    dd_pipeline,
+    deoldify_colorizer,
+    render_factor: int,
+    chroma: float,
+    cool: float,
+    deyellow: bool,
+    autocontrast: bool,
+    crop_page: bool,
+    rescue_chroma: float,
+):
+    full = imread_unicode(str(img_path))
+    crop, box = crop_photo_region(full, enabled=crop_page)
+    prepared = prepare_input(crop, deyellow=deyellow, autocontrast=autocontrast)
+
+    out = dd_pipeline.process(prepared)
+    out = adjust_color(out, chroma=chroma, cool=cool)
+    c1 = mean_chroma(out)
+
+    rescued = False
+    if c1 < rescue_chroma and deoldify_colorizer is not None:
+        try:
+            d_out = colorize_with_deoldify(deoldify_colorizer, prepared, render_factor)
+            d_out = adjust_color(d_out, chroma=max(chroma, 1.25), cool=cool)
+            c2 = mean_chroma(d_out)
+            if c2 > c1 * 1.15:
+                out = d_out
+                rescued = True
+                c1 = c2
+        except Exception as e:
+            print(f"  [rescue-skip] {e}")
+
+    # 贴回整页
+    if crop_page and box != (0, full.shape[0], 0, full.shape[1]):
+        # 页边中性灰
+        full_gray = neutralize_yellow(full)
+        final = paste_photo_region(full_gray, out, box)
+    else:
+        final = out
+
+    imwrite_unicode(str(dest), final)
+    tag = "rescued" if rescued else "ok"
+    print(f"[OK:{tag} c={c1:.1f}] {img_path.name} -> {dest.name}")
+    return True
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="老照片上色：DeOldify / DDColor")
+    p.add_argument(
+        "--model",
+        default="ddcolor",
+        choices=[
+            "deoldify",
+            "deoldify-stable",
+            "deoldify-artistic",
+            "ddcolor",
+            "ddcolor-modelscope",
+            "ddcolor-artistic",
+            "both",
+        ],
+        help="默认 ddcolor(=modelscope，更鲜艳)。artistic 更淡、易出灰片",
+    )
+    p.add_argument("--input", default="test_images", help="输入目录")
+    p.add_argument("--output", default="results", help="输出目录")
+    p.add_argument("--render-factor", type=int, default=30, help="DeOldify 强度，补救灰片时用")
+    p.add_argument("--input-size", type=int, default=768, help="DDColor 推理边长，越大越清晰、重影越少")
+    p.add_argument("--chroma", type=float, default=1.35, help="色彩浓度（默认 1.35，上一档；别盲目加到 1.5）")
+    p.add_argument("--cool", type=float, default=0.22, help="轻压红斑")
+    p.add_argument("--rescue-chroma", type=float, default=6.0, help="低于此色度则用 DeOldify 补救")
+    p.add_argument("--no-deyellow", action="store_true")
+    p.add_argument("--no-autocontrast", action="store_true")
+    p.add_argument("--no-crop-page", action="store_true", help="关闭相纸页芯裁切")
+    p.add_argument("--no-rescue", action="store_true", help="关闭灰片自动 DeOldify 补救")
+    p.add_argument("--limit", type=int, default=0, help="只处理前 N 张（调试用）")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    input_root = (ROOT / args.input).resolve()
+    output_root = (ROOT / args.output).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    img_paths = collect_images(input_root)
+    if args.limit > 0:
+        img_paths = img_paths[: args.limit]
+    if not img_paths:
+        print(f"在 {input_root} 下没有找到图片")
+        sys.exit(1)
+
+    deyellow = not args.no_deyellow
+    autocontrast = not args.no_autocontrast
+    crop_page = not args.no_crop_page
+    use_rescue = not args.no_rescue
+
+    print(
+        f"共 {len(img_paths)} 张 | model={args.model} size={args.input_size} "
+        f"chroma={args.chroma} | 去黄={deyellow} 裁页={crop_page} 补救={use_rescue}"
+    )
+
+    # 主模型：ddcolor / modelscope 更鲜艳；artistic 保留可选
+    want_dd = args.model in (
+        "ddcolor",
+        "ddcolor-modelscope",
+        "ddcolor-artistic",
+        "both",
+    )
+    want_deo = args.model in (
+        "deoldify",
+        "deoldify-stable",
+        "deoldify-artistic",
+        "both",
+    ) or use_rescue
+
+    dd_kind = "artistic" if args.model == "ddcolor-artistic" else "modelscope"
+    dd_pipeline = load_ddcolor(dd_kind, args.input_size) if want_dd else None
+
+    deo_artistic = args.model == "deoldify-artistic"
+    deoldify_colorizer = None
+    if want_deo:
+        # 补救默认用 Stable，更稳
+        deoldify_colorizer = load_deoldify(
+            artistic=deo_artistic if args.model.startswith("deoldify") else False,
+            render_factor=args.render_factor,
         )
 
-        # 裁剪底部水印
-        img_array = np.array(img_color)
-        if img_array.shape[0] > 20:
-            img_array = img_array[:-20, :, :]
+    ok = 0
+    if args.model.startswith("deoldify") and not args.model.startswith("ddcolor"):
+        # 纯 DeOldify 模式
+        for img_path in img_paths:
+            dest = out_path_for(img_path, input_root, output_root, "deoldify")
+            try:
+                full = imread_unicode(str(img_path))
+                crop, box = crop_photo_region(full, enabled=crop_page)
+                prepared = prepare_input(crop, deyellow=deyellow, autocontrast=autocontrast)
+                out = colorize_with_deoldify(deoldify_colorizer, prepared, args.render_factor)
+                out = adjust_color(out, chroma=args.chroma, cool=args.cool)
+                if crop_page:
+                    final = paste_photo_region(neutralize_yellow(full), out, box)
+                else:
+                    final = out
+                imwrite_unicode(str(dest), final)
+                print(f"[OK c={mean_chroma(out):.1f}] {img_path.name}")
+                ok += 1
+            except Exception as e:
+                print(f"[FAIL] {img_path.name}: {e}")
+    else:
+        prefix = "ddcolor_artistic" if dd_kind == "artistic" else "ddcolor"
+        for img_path in img_paths:
+            dest = out_path_for(img_path, input_root, output_root, prefix)
+            try:
+                if process_one(
+                    img_path,
+                    dest,
+                    dd_pipeline=dd_pipeline,
+                    deoldify_colorizer=deoldify_colorizer if use_rescue else None,
+                    render_factor=args.render_factor,
+                    chroma=args.chroma,
+                    cool=args.cool,
+                    deyellow=deyellow,
+                    autocontrast=autocontrast,
+                    crop_page=crop_page,
+                    rescue_chroma=args.rescue_chroma,
+                ):
+                    ok += 1
+            except Exception as e:
+                print(f"[FAIL] {img_path.name}: {e}")
+                if "out of memory" in str(e).lower():
+                    print("提示: 把 --input-size 降到 512")
 
-        # 转换通道并用 Unicode 安全方式保存
-        img_bgr_out = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        imwrite_unicode(OUTPUT_IMAGE, img_bgr_out)
-
-        print(f"✅ 处理完成：{img_path}")
-        print(f"   结果保存：{os.path.abspath(OUTPUT_IMAGE)}")
-        return True
-    except Exception as e:
-        print(f"\n❌ 处理失败 {img_path}：{str(e)}")
-        if "out of memory" in str(e).lower():
-            print("💡 把render_factor=35改成20即可解决显存不足")
-        return False
+    print(f"\n完成：{ok}/{len(img_paths)}")
+    print(f"结果目录：{output_root}")
+    print("当前默认：chroma=1.35 input-size=768（上一档）")
 
 
-def batch_process():
-    supported_formats = (".jpg", ".jpeg", ".png", ".JPG", ".PNG", ".bmp")
-    img_paths = []
-    for root, dirs, files in os.walk("test_images"):
-        for file in files:
-            if file.endswith(supported_formats):
-                img_paths.append(os.path.join(root, file))
-
-    if not img_paths:
-        print(f"❌ 在test_images及子文件夹中未找到图片（支持格式：{supported_formats}）")
-        exit(1)
-
-    print(f"\n📌 共找到 {len(img_paths)} 张图片，开始批量上色...")
-    success_count = 0
-    for img_path in img_paths:
-        if process_single_image(img_path, colorizer):
-            success_count += 1
-
-    print(f"\n🎉 批量处理结束！成功 {success_count}/{len(img_paths)} 张")
-    print(f"📁 所有结果保存在：{os.path.abspath('results')}")
-
-
-# ===================== 执行 =====================
 if __name__ == "__main__":
-    batch_process()
+    main()

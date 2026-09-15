@@ -27,12 +27,7 @@ def build_ddcolor_model(
     device=None,
     **kwargs,
 ):
-    """Build a DDColor model and load weights.
-
-    This helper is intentionally backend-agnostic: `model_cls` can be
-    `ddcolor.DDColor` or `basicsr.archs.ddcolor_arch.DDColor` as long as
-    it supports the common constructor args used below.
-    """
+    """Build a DDColor model and load weights."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -41,7 +36,6 @@ def build_ddcolor_model(
     encoder_name = "convnext-t" if model_size == "tiny" else "convnext-l"
 
     if decoder_type == "MultiScaleColorDecoder":
-        # keep default consistent with existing scripts
         kwargs.setdefault("num_queries", 100)
         kwargs.setdefault("num_scales", 3)
         kwargs.setdefault("dec_layers", 9)
@@ -65,6 +59,36 @@ def build_ddcolor_model(
     model = model.to(device)
     model.eval()
     return model
+
+
+def _guided_upsample_ab(ab_low: np.ndarray, guide_l: np.ndarray, out_hw) -> np.ndarray:
+    """Upsample ab with L-channel guidance to reduce red/blue edge fringing.
+
+    ab_low: (h, w, 2) float
+    guide_l: (H, W) float luminance in [0,1] or [0,100]
+    """
+    H, W = out_hw
+    a = cv2.resize(ab_low[:, :, 0], (W, H), interpolation=cv2.INTER_CUBIC)
+    b = cv2.resize(ab_low[:, :, 1], (W, H), interpolation=cv2.INTER_CUBIC)
+
+    # Normalize guide to 0-255 for edge detection
+    g = guide_l.astype(np.float32)
+    g = g - g.min()
+    g = g / (g.max() + 1e-6)
+    g8 = (g * 255.0).astype(np.uint8)
+
+    # Bilateral on chroma (edge-preserving) kills zipper / red-blue fringes
+    a_s = cv2.bilateralFilter(a.astype(np.float32), d=7, sigmaColor=0.05, sigmaSpace=7)
+    b_s = cv2.bilateralFilter(b.astype(np.float32), d=7, sigmaColor=0.05, sigmaSpace=7)
+
+    edges = cv2.Canny(g8, 60, 150)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    edges = cv2.GaussianBlur(edges.astype(np.float32) / 255.0, (7, 7), 0)
+    edges = edges[..., None]
+
+    a = a * (1.0 - edges[..., 0] * 0.85) + a_s * (edges[..., 0] * 0.85)
+    b = b * (1.0 - edges[..., 0] * 0.85) + b_s * (edges[..., 0] * 0.85)
+    return np.stack([a, b], axis=-1)
 
 
 class ColorizationPipeline:
@@ -93,35 +117,32 @@ class ColorizationPipeline:
 
             height, width = img_bgr.shape[:2]
 
-            img = (img_bgr / 255.0).astype(np.float32)
-            orig_l = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)[:, :, :1]  # (h, w, 1)
+            # True neutral gray RGB (avoid yellowed paper confusing the net)
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-            # resize rgb image -> lab -> get grey -> rgb
-            img_resized = cv2.resize(img, (self.input_size, self.input_size))
-            img_l = cv2.cvtColor(img_resized, cv2.COLOR_BGR2Lab)[:, :, :1]
-            img_gray_lab = np.concatenate(
-                (img_l, np.zeros_like(img_l), np.zeros_like(img_l)), axis=-1
-            )
-            img_gray_rgb = cv2.cvtColor(img_gray_lab, cv2.COLOR_LAB2RGB)
+            img = (gray_bgr / 255.0).astype(np.float32)
+            orig_l = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)[:, :, :1]  # float Lab L
+
+            img_resized = cv2.resize(img, (self.input_size, self.input_size), interpolation=cv2.INTER_AREA)
+            # Feed proper grayscale RGB, not Lab-with-zero-ab roundtrip quirks
+            gray_rgb = cv2.cvtColor(
+                cv2.resize(gray, (self.input_size, self.input_size), interpolation=cv2.INTER_AREA),
+                cv2.COLOR_GRAY2RGB,
+            ).astype(np.float32) / 255.0
 
             tensor_gray_rgb = (
-                torch.from_numpy(img_gray_rgb.transpose((2, 0, 1)))
+                torch.from_numpy(gray_rgb.transpose((2, 0, 1)))
                 .float()
                 .unsqueeze(0)
                 .to(self.device)
             )
 
-            output_ab = self.model(tensor_gray_rgb).cpu()  # (1, 2, input_size, input_size)
+            output_ab = self.model(tensor_gray_rgb).cpu()  # (1, 2, S, S)
+            ab_low = output_ab[0].float().numpy().transpose(1, 2, 0)  # (S,S,2)
 
-            # resize ab -> concat original l -> bgr
-            output_ab_resized = (
-                F.interpolate(output_ab, size=(height, width))[0]
-                .float()
-                .numpy()
-                .transpose(1, 2, 0)
-            )
+            output_ab_resized = _guided_upsample_ab(ab_low, orig_l[:, :, 0], (height, width))
             output_lab = np.concatenate((orig_l, output_ab_resized), axis=-1)
-            output_bgr = cv2.cvtColor(output_lab, cv2.COLOR_LAB2BGR)
-
-            output_img = (output_bgr * 255.0).round().astype(np.uint8)
+            output_bgr = cv2.cvtColor(output_lab, cv2.COLOR_Lab2BGR)
+            output_img = (np.clip(output_bgr, 0, 1) * 255.0).round().astype(np.uint8)
             return output_img

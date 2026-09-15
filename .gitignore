@@ -2,6 +2,7 @@
 datasets/*
 experiments/*
 results/*
+test_videos/*
 tb_logger/*
 wandb/*
 tmp/*

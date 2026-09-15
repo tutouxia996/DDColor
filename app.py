@@ -16,7 +16,13 @@ import cv2
 import gradio as gr
 import numpy as np
 
-from colorize_service import ENGINE, imread_unicode, imwrite_unicode, mean_chroma
+from colorize_service import (
+    ENGINE,
+    imread_unicode,
+    imwrite_unicode,
+    mean_chroma,
+    resolve_video_output,
+)
 
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
@@ -225,6 +231,35 @@ def run_image_batch(
         return [], f"失败: {e}"
 
 
+def _video_path_from_gradio(video) -> str:
+    if video is None:
+        raise ValueError("请先上传黑白视频")
+    if isinstance(video, dict):
+        video_path = video.get("path") or video.get("name")
+    else:
+        video_path = video
+    if not video_path or not os.path.isfile(str(video_path)):
+        raise ValueError(f"无效视频路径: {video_path}")
+    return str(video_path)
+
+
+def preview_video_output(video, output_path: str) -> str:
+    try:
+        if video is None:
+            vp = "（上传视频后显示文件名）"
+            stem = "视频名"
+            raw = (output_path or "").strip().strip('"')
+            if not raw:
+                return str(RESULTS / f"{stem}AI上色.mp4")
+            p = Path(raw)
+            if p.suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+                return str(p)
+            return str(p / f"{stem}AI上色.mp4")
+        return str(resolve_video_output(_video_path_from_gradio(video), output_path))
+    except Exception as e:
+        return f"路径预览失败: {e}"
+
+
 def run_video(
     video,
     model,
@@ -236,21 +271,13 @@ def run_video(
     autocontrast,
     frame_stride,
     max_frames,
+    output_path,
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
-        if video is None:
-            return None, "请先上传黑白视频"
-        # Gradio may give path str or dict
-        if isinstance(video, dict):
-            video_path = video.get("path") or video.get("name")
-        else:
-            video_path = video
-        if not video_path or not os.path.isfile(str(video_path)):
-            return None, f"无效视频路径: {video_path}"
-
+        video_path = _video_path_from_gradio(video)
         out_path = ENGINE.colorize_video(
-            str(video_path),
+            video_path,
             model=model,
             input_size=int(input_size),
             chroma=float(chroma),
@@ -260,6 +287,7 @@ def run_video(
             autocontrast=bool(autocontrast),
             frame_stride=int(frame_stride),
             max_frames=int(max_frames) if max_frames else 0,
+            output_path=(output_path or "").strip() or None,
             progress=progress,
         )
         return out_path, f"完成 | 已保存: {out_path}"
@@ -373,15 +401,34 @@ def build_ui():
                         in_vid = gr.Video(label="上传黑白视频")
                         frame_stride = gr.Slider(1, 5, value=1, step=1, label="隔帧（1=每帧都上色）")
                         max_frames = gr.Slider(0, 500, value=0, step=10, label="最多处理帧数（0=不限制）")
+                        vid_out_path = gr.Textbox(
+                            label="输出位置（文件夹或完整 .mp4 路径；留空则保存到 results）",
+                            placeholder=rf"例如 D:\videos  或  D:\videos\结果.mp4",
+                        )
+                        vid_out_preview = gr.Textbox(
+                            label="将保存到",
+                            interactive=False,
+                            value=str(RESULTS / "视频名AI上色.mp4"),
+                        )
                         btn_vid = gr.Button("开始上色视频", variant="primary")
                     with gr.Column():
                         out_vid = gr.Video(label="上色结果")
                         vid_log = gr.Textbox(label="状态", lines=3)
+                in_vid.change(
+                    preview_video_output,
+                    inputs=[in_vid, vid_out_path],
+                    outputs=[vid_out_preview],
+                )
+                vid_out_path.change(
+                    preview_video_output,
+                    inputs=[in_vid, vid_out_path],
+                    outputs=[vid_out_preview],
+                )
                 btn_vid.click(
                     run_video,
                     inputs=[
                         in_vid, model, input_size, chroma, cool, render_factor,
-                        deyellow, autocontrast, frame_stride, max_frames,
+                        deyellow, autocontrast, frame_stride, max_frames, vid_out_path,
                     ],
                     outputs=[out_vid, vid_log],
                 )

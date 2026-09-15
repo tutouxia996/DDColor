@@ -17,6 +17,8 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / "models"
+RESULTS = ROOT / "results"
+RESULTS.mkdir(exist_ok=True)
 
 # Prefer D: for caches / temps
 _TEMP = Path(r"D:\AI_Temp\colorize_ui")
@@ -352,6 +354,7 @@ class ColorizeEngine:
         autocontrast: bool = True,
         frame_stride: int = 1,
         max_frames: int = 0,
+        output_path: str | None = None,
         progress=None,
     ) -> str:
         """Colorize video frame-by-frame. Returns output mp4 path."""
@@ -415,7 +418,6 @@ class ColorizeEngine:
             if progress is not None:
                 progress(0.05 + 0.85 * (i / max(n, 1)), desc=f"上色帧 {i+1}/{n}")
             img = imread_unicode(str(fp))
-            # For sparse stride, also write intermediate duplicates later via ffmpeg fps
             out = self.colorize_bgr(
                 img,
                 model=model if model != "deoldify-video" else "deoldify",
@@ -427,15 +429,14 @@ class ColorizeEngine:
                 autocontrast=autocontrast,
                 crop_page=False,
             )
-            # Keep sequential numbering for ffmpeg
             imwrite_unicode(str(color_dir / f"{i+1:06d}.jpg"), out)
 
         if progress is not None:
             progress(0.92, desc="合成视频...")
 
         no_audio = work / "colorized_no_audio.mp4"
-        result = Path(r"D:\work\pythonWork\DDColor-master\results") / f"video_{Path(video_path).stem}_{uuid.uuid4().hex[:8]}.mp4"
-        result.parent.mkdir(exist_ok=True)
+        result = _resolve_video_output(video_path, output_path)
+        result.parent.mkdir(parents=True, exist_ok=True)
 
         subprocess.run(
             [
@@ -468,12 +469,34 @@ class ColorizeEngine:
         if progress is not None:
             progress(1.0, desc="完成")
 
-        # cleanup heavy temps (keep result)
         try:
             shutil.rmtree(work, ignore_errors=True)
         except Exception:
             pass
         return str(result)
+
+
+def resolve_video_output(video_path: str, output_path: str | None = None) -> Path:
+    """解析视频输出路径：留空→results；填文件夹→文件夹内；填 .mp4→该文件。"""
+    stem = Path(video_path).stem
+    default_name = f"{stem}AI上色.mp4"
+    raw = (output_path or "").strip().strip('"')
+    if not raw:
+        return RESULTS / default_name
+    p = Path(raw)
+    # 已存在的目录，或路径看起来像目录（无后缀）
+    if p.is_dir() or (not p.suffix and not p.exists()):
+        p.mkdir(parents=True, exist_ok=True)
+        return p / default_name
+    if p.suffix.lower() not in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+        p.mkdir(parents=True, exist_ok=True)
+        return p / default_name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# 兼容 colorize_video 内部旧名
+_resolve_video_output = resolve_video_output
 
 
 ENGINE = ColorizeEngine()
